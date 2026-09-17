@@ -79,6 +79,16 @@ _FAULT_CLASSES = ("drift", "bias", "delay", "loss", "breakdown", "quality", _PUL
 # keys, repr floats, wall/clock fields excluded).
 _WALLCLOCK_KEYS = frozenset({"wall_s", "timestamp", "clock", "elapsed"})
 
+# D1 additive-only keys excluded from the canonical replay digest (plan
+# .omo/plans/minipro-24-t9-final.md v4 §2 M2 + §7 BAR-DIGEST): the
+# STARVED-split census nested under flow_stats["starved_split"] is pure
+# post-hoc accounting over states + the per-step kit snapshot — no
+# condition, RNG, draw-order, or event change — so the digest must stay
+# bit-identical to its pre-D1 value (777+F-21 d2b4fb23…, 777-clean
+# 60320697…). replay_digest scrubs these before hashing; old records
+# without the key hash exactly as before.
+_DIGEST_SCRUB_FLOW_KEYS = frozenset({"starved_split"})
+
 # Coverage matrix axes (TC-006): 5 partition groups x 7 channels x 7
 # classes. The class axis reuses _FAULT_CLASSES (runtime-equal to the
 # oracle literals; the source spelling above dodges the T3 grep).
@@ -607,18 +617,77 @@ def _line_process(env, spec, shared):
         yield env.timeout(1)
 
 
+def _xfer_account_drained(part, src, hold, wait, kit, shared):
+    # D2 drain-bucket accounting (plan §2 M1): one overtime/leftover AGV
+    # delivery logged exactly like a normal delivery (kit append, xfer_open
+    # decrement, agv_waits/parts pair, SBUF drained) plus a drained marker
+    # and the flow xfer_drained bucket. Logged t is clamped to T-1 so every
+    # timestamp stays in-episode (t<T); hold/wait reuse already-consumed
+    # draws. Shared by the overtime strand branch and the synchronous
+    # leftover settle — a single accounting site, never double-logged.
+    t_acc = T - 1
+    kit[part["line"]].append(part)
+    shared["flow"]["xfer_open"] -= 1
+    shared["flow"]["xfer_drained"] += 1
+    shared["agv_waits"].append(
+        {
+            "t": t_acc,
+            "part": part["id"],
+            "hold": hold,
+            "wait": wait,
+            "drained": True,
+        }
+    )
+    shared["parts"].append(
+        {
+            "id": part["id"],
+            "t": t_acc,
+            "machine": src,
+            "via": "AGV",
+            "disposition": "diverted" if part["diverted"] else "delivered",
+            "passes": part.get("passes", 0),
+            "flag": part.get("flag", "OK"),
+            "drained": True,
+        }
+    )
+    if src == "SBUF":
+        shared["sbuf"]["drained"] += 1
+    _emit(
+        shared,
+        "AGV_WAIT",
+        t_acc,
+        src,
+        {"part": part["id"], "wait": wait, "hold": hold, "drained": True},
+    )
+
+
 def _agv_xfer(env, agv, rng_agv, part, src, kit, shared, t_req):
     """One tail/SBUF->ASM0-kit transfer: request, hold, release, log wait."""
     hold = int(rng_agv.integers(AGV_STEPS[0], AGV_STEPS[1] + 1))
+    # D2 pending registry (plan §2 M1): setdefault so unit harnesses driving
+    # this process with a hand-built shared dict keep working (D1 precedent).
+    # Lets the post-T synchronous settle account leftovers with their
+    # already-drawn holds — no new RNG draws, ever.
+    _pend = shared.setdefault("xfer_pending", {})
+    _pend[part["id"]] = {
+        "part": part,
+        "src": src,
+        "t_req": t_req,
+        "hold": hold,
+        "wait": None,
+    }
     req = agv.request()
     yield req
     wait = int(env.now) - t_req
+    _pend[part["id"]]["wait"] = wait
     yield env.timeout(hold)
     t_del = int(env.now)
     agv.release(req)
+    _pend.pop(part["id"], None)
     if t_del >= T:
-        # Episode ended mid-transfer: part stays counted as in-flight
-        # (conserved via flow xfer_open bucket), never double-logged.
+        # D2 drain-bucket closeout (plan §2 M1): this delivery landed in
+        # the bounded overtime drain (SimPy run(until=T) skips events AT T).
+        _xfer_account_drained(part, src, hold, wait, kit, shared)
         return
     kit[part["line"]].append(part)
     shared["flow"]["xfer_open"] -= 1
@@ -644,9 +713,9 @@ def _agv_xfer(env, agv, rng_agv, part, src, kit, shared, t_req):
 
 
 def _agv_dispatcher(env, agv, rng_agv, stores, kit, shared):
-    """Drain SBUF (first) then tail buffers to kit intake via AGV xfers.
+    """Drain tail buffers and SBUF to kit intake via AGV xfers, round-robin.
 
-    The AGV queue is bounded (2 in service + 2 queued): beyond that the
+    The AGV queue is bounded (AGV_CAP in service + 2 queued): beyond that the
     dispatcher holds off spawning, so tail buffers fill and BLOCKED
     backpressure (plus SBUF divert) propagates instead of hiding WIP in an
     unbounded resource queue.
@@ -661,18 +730,23 @@ def _agv_dispatcher(env, agv, rng_agv, stores, kit, shared):
         shared["flow"]["xfer_open"] += 1
         env.process(_agv_xfer(env, agv, rng_agv, part, src, kit, shared, int(env.now)))
 
+    # D3b fair order (plan §2 M3, dispatcher half only): SBUF + tails
+    # served in a rotating round-robin instead of SBUF-first, so a full
+    # SBUF can no longer starve the tails. Gate semantics preserved: each
+    # source still moves at most one part per tick and only while
+    # _gate_open() holds; no cap/hold change, no new RNG draws. Head-spawn
+    # physics untouched (no early-stop gating here).
+    sources = [("SBUF", sbuf)] + [(name, store) for store, name in tails]
+    rr = 0
     while True:
         if int(env.now) >= T:
             return
-        if len(sbuf.items) > 0 and _gate_open():
-            req = sbuf.get()
-            yield req
-            _spawn(req.value, "SBUF")
-        for store, name in tails:
+        for name, store in sources[rr:] + sources[:rr]:
             if len(store.items) > 0 and _gate_open():
                 req = store.get()
                 yield req
                 _spawn(req.value, name)
+        rr = (rr + 1) % len(sources)
         yield env.timeout(1)
 
 
@@ -693,9 +767,19 @@ def _asm0_process(env, asm01, kit, shared):
     tput_row = shared["tput"][idx]
     fx = shared["fx"].get(name, [])
     held, rem, batch = False, 0, None
+    # D1 log handle (plan §2 M2): setdefault so unit harnesses driving this
+    # process with a hand-built shared dict (no run_episode) keep working.
+    _kit_log = shared.setdefault("kit_empty_log", [])
     down_left, dfault, ar, prev = 0, None, 0.0, "RUN"
     for t in range(T):
         detail = {}
+        # D1 additive snapshot (plan §2 M2): per-step kit-emptiness for the
+        # STARVED-split census join. kit_missing in the STARVE_ON detail
+        # emits on entry only, so the census joins state rows against THIS
+        # per-step state instead of counting transition events. Observational
+        # only: no yields/draws/conditions touched. Reset each step; only
+        # steps where ASM0 actually STARVEs are ever read back.
+        miss_now: tuple = ()
         inj = _inj_down(fx, t)
         if inj is not None and down_left > 0:
             down_left = 0
@@ -719,6 +803,7 @@ def _asm0_process(env, asm01, kit, shared):
             st, tput = "DOWN", 0
         elif not held:
             missing = [ln for ln in ("A", "B", "C") if not kit[ln]]
+            miss_now = tuple(missing)
             if missing:
                 st, tput = "STARVED", 0
                 if prev != "STARVED":
@@ -766,6 +851,7 @@ def _asm0_process(env, asm01, kit, shared):
         if lspec is not None and shared["drop"].random() < lspec["drop_rate"]:
             val = obs_row[t - 1] if t > 0 else val
         obs_row[t], state_row[t], tput_row[t] = val, st, tput
+        _kit_log.append(miss_now)
         yield env.timeout(1)
 
 
@@ -1090,10 +1176,23 @@ def run_episode(
             "sunk": 0,
             "scrapped": 0,
             "xfer_open": 0,
+            # D2 drain-bucket (plan §2 M1): stranded in-flight transfers
+            # settled by the bounded overtime drain count here; reported,
+            # never subtracted from STARVED/RUN denominators.
+            "xfer_drained": 0,
             "rejected": 0,
             "reworked": 0,
         },
         "sbuf": {"diverted": 0, "drained": 0},
+        # D1 additive (plan §2 M2): per-step kit-emptiness snapshots logged by
+        # _asm0_process (one tuple per step, index-aligned with states rows).
+        # Census join source for the KIT_MISS-by-line split; never read by
+        # any condition/dispatcher/RNG path.
+        "kit_empty_log": [],
+        # D2 additive (plan §2 M1): in-flight AGV transfer registry keyed by
+        # part id (see _agv_xfer); drain/settle bookkeeping only, never read
+        # by any condition/dispatcher/RNG path.
+        "xfer_pending": {},
         "specs": specs,
         "fx": fx,
         "gwin": [(s["t0"], s["t1"]) for s in specs],
@@ -1132,6 +1231,31 @@ def run_episode(
     buf_rows = [[0] * T for _ in range(N_BUFFERS)]
     env.process(_monitor(env, stores, buf_order, buf_rows))
     env.run(until=T)
+    # D2 bounded overtime drain (plan §2 M1 + §4 F4; SimPy docs: run(until)
+    # skips events AT T, so in-flight AGV transfers never deliver without
+    # this). Overtime is hard-bounded to AGV_STEPS[1] (8) steps past T;
+    # the dispatcher already halted at T (no new spawns) and every other
+    # process ran its for-t-in-range(T) loop out (no new RNG draws, no
+    # obs/states/buffers extension — only pending _agv_xfer completions run).
+    if shared["flow"]["xfer_open"] > 0:
+        env.run(until=T + AGV_STEPS[1])
+    # D2 synchronous leftover settle (plan §2 M1): anything still open after
+    # the ≤8-step overtime drain (deep AGV-queue cascade outruns one max
+    # hold) is accounted here in Python with zero additional sim-time — the
+    # same helper, the same T-1 clamp, already-drawn holds (wait falls back
+    # to drain-end minus t_req for transfers that never acquired the AGV),
+    # no new spawns/draws, no obs/states/buffers touch. xfer_open reads 0
+    # every episode from here on.
+    _leftover = shared.get("xfer_pending", {})
+    if _leftover:
+        for _rec in list(_leftover.values()):
+            _wait = _rec["wait"]
+            if _wait is None:
+                _wait = int(env.now) - _rec["t_req"]
+            _xfer_account_drained(
+                _rec["part"], _rec["src"], _rec["hold"], _wait, kit, shared
+            )
+        _leftover.clear()
     # Post-run store census (exact WIP audit — the channel-6 series tail can
     # miss last-step puts/gets that land after the monitor's final record).
     store_final = {k: len(stores[k].items) for k in buf_order}
@@ -1159,6 +1283,9 @@ def run_episode(
         "rejected": shared["flow"]["rejected"],
         "reworked": shared["flow"]["reworked"],
         "xfer_open": shared["flow"]["xfer_open"],
+        # D2 drain-bucket census (plan §2 M1): stranded count settled by the
+        # overtime drain; xfer_open must read 0 every episode from here on.
+        "xfer_drained": shared["flow"]["xfer_drained"],
         "held_line": held_line,
         "held_asm0_batch": 1 if shared["held"][MACHINE_INDEX["ASM0"]] else 0,
         "held_asm12": sum(
@@ -1170,6 +1297,54 @@ def run_episode(
         "kit_C": len(kit["C"]),
         "c7tail": len(stores["_C7TAIL"].items),
         "store_final": store_final,
+    }
+    # D1 STARVED-split census (plan §2 M2 + §4 F3): additive state-row step
+    # counts nested under flow_stats (no top-level record key change, so
+    # test_record_keys holds; replay_digest scrubs this sub-dict so pins
+    # hold). Buckets partition every STARVED cell by machine group, hence
+    # sum EXACTLY to the raw STARVED total:
+    # - feed_wait: line (A/B/C) STARVED. By construction each such step saw
+    #   its immediate upstream gap empty (_line_process STARVEs only when
+    #   len(up.items) == 0; heads with up=None spawn and never STARVE).
+    # - kit_miss_A/B/C: ASM0 STARVED joined per-step to the kit snapshot
+    #   (kit_missing emits on STARVED-entry only, so transition events
+    #   undercount — the per-step join is the whole point). A multi-empty
+    #   step attributes by A>B>C priority so A+B+C == ASM0 STARVED exactly.
+    # - cell_wait: ASM1/ASM2 STARVED on empty upstream store.
+    # - rwk_idle: RWK0 STARVED on empty RWK_RET intake.
+    _st = shared["states"]
+    _is_st = "STARVED"
+    _line_idx = [MACHINE_INDEX[n] for n in _LINES]
+    _asm0 = MACHINE_INDEX["ASM0"]
+    _cell_idx = (MACHINE_INDEX["ASM1"], MACHINE_INDEX["ASM2"])
+    _rwk0 = MACHINE_INDEX["RWK0"]
+    _feed_wait = sum(1 for i in _line_idx for t in range(T) if _st[i][t] == _is_st)
+    _kit_log = shared["kit_empty_log"]
+    _kit_a = _kit_b = _kit_c = 0
+    for _t in range(T):
+        if _st[_asm0][_t] == _is_st:
+            _miss = _kit_log[_t]
+            if "A" in _miss:
+                _kit_a += 1
+            elif "B" in _miss:
+                _kit_b += 1
+            else:
+                _kit_c += 1
+    _cell_wait = sum(1 for i in _cell_idx for t in range(T) if _st[i][t] == _is_st)
+    _rwk_idle = sum(1 for t in range(T) if _st[_rwk0][t] == _is_st)
+    _raw_st = sum(
+        1 for m in range(N_MACHINES) for t in range(T) if _st[m][t] == _is_st
+    )
+    assert _feed_wait + _kit_a + _kit_b + _kit_c + _cell_wait + _rwk_idle == _raw_st
+    flow_stats["starved_split"] = {
+        "feed_wait": _feed_wait,
+        "kit_miss_A": _kit_a,
+        "kit_miss_B": _kit_b,
+        "kit_miss_C": _kit_c,
+        "kit_miss": _kit_a + _kit_b + _kit_c,
+        "cell_wait": _cell_wait,
+        "rwk_idle": _rwk_idle,
+        "raw_starved": _raw_st,
     }
     return {
         "seed": seed,
@@ -1359,8 +1534,16 @@ def replay_digest(record):
 
     Wall/clock fields are excluded. Named digest (not hash) so the T1
     no-bare-default_rng/no-hash-seeding source grep stays green.
+
+    D1 additive-only (plan §7 BAR-DIGEST): flow_stats sub-dicts listed in
+    _DIGEST_SCRUB_FLOW_KEYS (pure census accounting, no behavior change)
+    are scrubbed before hashing so same-seed digests stay bit-identical.
     """
     scrubbed = {k: v for k, v in record.items() if k not in _WALLCLOCK_KEYS}
+    _fs = scrubbed.get("flow_stats")
+    if isinstance(_fs, dict) and any(k in _fs for k in _DIGEST_SCRUB_FLOW_KEYS):
+        _fs = {k: v for k, v in _fs.items() if k not in _DIGEST_SCRUB_FLOW_KEYS}
+        scrubbed = {**scrubbed, "flow_stats": _fs}
     return hashlib.sha256(
         json.dumps(scrubbed, sort_keys=True, default=repr).encode()
     ).hexdigest()
